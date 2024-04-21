@@ -1,4 +1,3 @@
-
 // Original design from:
 // =============================================================================
 // XNU kperf/kpc
@@ -7,8 +6,8 @@
 // References:
 //
 // XNU source (since xnu 2422.1.72):
-// https://github.com/apple/darwin-xnu/blob/main/osfmk/kern/kpc.h
-// https://github.com/apple/darwin-xnu/blob/main/bsd/kern/kern_kpc.c
+// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/kpc.h
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_kpc.c
 //
 // Lightweight PET (Profile Every Thread, since xnu 3789.1.32):
 // https://github.com/apple/darwin-xnu/blob/main/osfmk/kperf/pet.c
@@ -33,74 +32,24 @@
 // Released into the public domain (unlicense.org).
 // =============================================================================
 
-#ifndef M1CYCLES_H
-#define M1CYCLES_H
+#ifndef APPLE_ARM_EVENTS_H
+#define APPLE_ARM_EVENTS_H
 
+#include <initializer_list>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <dlfcn.h>          // for dlopen() and dlsym()
+#include <algorithm>
+#include <dlfcn.h> // for dlopen() and dlsym()
+#include <initializer_list>
 #include <mach/mach_time.h> // for mach_absolute_time()
 #include <sys/kdebug.h>     // for kdebug trace decode
 #include <sys/sysctl.h>     // for sysctl()
 #include <unistd.h>         // for usleep()
-
-struct performance_counters {
-  double cycles;
-  double branches;
-  double missed_branches;
-  double instructions;
-  performance_counters(uint64_t c, uint64_t b, uint64_t m, uint64_t i)
-      : cycles(c), branches(b), missed_branches(m), instructions(i) {}
-  performance_counters(double c, double b, double m, double i)
-      : cycles(c), branches(b), missed_branches(m), instructions(i) {}
-  performance_counters(double init)
-      : cycles(init), branches(init), missed_branches(init),
-        instructions(init) {}
-
-  inline performance_counters &operator-=(const performance_counters &other) {
-    cycles -= other.cycles;
-    branches -= other.branches;
-    missed_branches -= other.missed_branches;
-    instructions -= other.instructions;
-    return *this;
-  }
-  inline performance_counters &min(const performance_counters &other) {
-    cycles = other.cycles < cycles ? other.cycles : cycles;
-    branches = other.branches < branches ? other.branches : branches;
-    missed_branches = other.missed_branches < missed_branches
-                          ? other.missed_branches
-                          : missed_branches;
-    instructions =
-        other.instructions < instructions ? other.instructions : instructions;
-    return *this;
-  }
-  inline performance_counters &operator+=(const performance_counters &other) {
-    cycles += other.cycles;
-    branches += other.branches;
-    missed_branches += other.missed_branches;
-    instructions += other.instructions;
-    return *this;
-  }
-
-  inline performance_counters &operator/=(double numerator) {
-    cycles /= numerator;
-    branches /= numerator;
-    missed_branches /= numerator;
-    instructions /= numerator;
-    return *this;
-  }
-};
-
-inline performance_counters operator-(const performance_counters &a,
-                                      const performance_counters &b) {
-  return performance_counters(a.cycles - b.cycles, a.branches - b.branches,
-                              a.missed_branches - b.missed_branches,
-                              a.instructions - b.instructions);
-}
+#include <valarray>
 
 typedef float f32;
 typedef double f64;
@@ -147,7 +96,8 @@ typedef size_t usize;
 #define KPC_MAX_COUNTERS 32
 
 // Bits for defining what to do on an action.
-// Defined in https://github.com/apple/darwin-xnu/blob/main/osfmk/kperf/action.h
+// Defined in
+// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kperf/action.h
 #define KPERF_SAMPLER_TH_INFO (1U << 0)
 #define KPERF_SAMPLER_TH_SNAPSHOT (1U << 1)
 #define KPERF_SAMPLER_KSTACK (1U << 2)
@@ -162,6 +112,7 @@ typedef size_t usize;
 #define KPERF_SAMPLER_SYS_MEM (1U << 11)
 #define KPERF_SAMPLER_TH_INSCYC (1U << 12)
 #define KPERF_SAMPLER_TK_INFO (1U << 13)
+#define KPERT_SAMPLER_EXSTACK (1U << 14)
 
 // Maximum number of kperf action ids.
 #define KPERF_ACTION_MAX (32)
@@ -752,7 +703,7 @@ static bool lib_init(void) {
 
 // -----------------------------------------------------------------------------
 // kdebug private structs
-// https://github.com/apple/darwin-xnu/blob/main/bsd/sys_private/kdebug_private.h
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/kdebug_private.h
 // -----------------------------------------------------------------------------
 
 /*
@@ -822,32 +773,42 @@ typedef struct {
 } event_alias;
 
 /// Event names from /usr/share/kpep/<name>.plist
+
+#define PROFILE_EVENTS_LIST(_, X)                                              \
+  _(EventCycles, "FIXED_CYCLES")                                               \
+  _(EventInsts, "FIXED_INSTRUCTIONS")                                          \
+  X(EventBrs, "INST_BRANCH")                                                   \
+  X(EventCalls, "INST_BRANCH_CALL")                                            \
+  X(EventRets, "INST_BRANCH_RET")                                              \
+  X(EventIndirBrs, "INST_BRANCH_INDIR")                                        \
+  X(EventTakenBrs, "INST_BRANCH_TAKEN")                                        \
+  X(EventBrMisses, "BRANCH_MISPRED_NONSPEC")                                   \
+  X(EventCallMisses, "BRANCH_CALL_INDIR_MISPRED_NONSPEC")                      \
+  X(EventRetMisses, "BRANCH_RET_INDIR_MISPRED_NONSPEC")                        \
+  X(EventCondBrMisses, "BRANCH_COND_MISPRED_NONSPEC")                          \
+  X(EventIndirMisses, "BRANCH_INDIR_MISPRED_NONSPEC")
+
+#define PROFILE_EVENTS_DISABLE(name, value)
+
 static const event_alias profile_events[] = {
-    {"cycles",
-     {
-         "FIXED_CYCLES",            // Apple A7-A15
-         "CPU_CLK_UNHALTED.THREAD", // Intel Core 1th-10th
-         "CPU_CLK_UNHALTED.CORE",   // Intel Yonah, Merom
-     }},
-    {"instructions",
-     {
-         "FIXED_INSTRUCTIONS", // Apple A7-A15
-         "INST_RETIRED.ANY"    // Intel Yonah, Merom, Core 1th-10th
-     }},
-    {"branches",
-     {
-         "INST_BRANCH",                  // Apple A7-A15
-         "BR_INST_RETIRED.ALL_BRANCHES", // Intel Core 1th-10th
-         "INST_RETIRED.ANY",             // Intel Yonah, Merom
-     }},
-    {"branch-misses",
-     {
-         "BRANCH_MISPRED_NONSPEC",       // Apple A7-A15, since iOS 15, macOS 12
-         "BRANCH_MISPREDICT",            // Apple A7-A14
-         "BR_MISP_RETIRED.ALL_BRANCHES", // Intel Core 2th-10th
-         "BR_INST_RETIRED.MISPRED",      // Intel Yonah, Merom
-     }},
+#define PROFILE_EVENTS_ENUM(name, value) {#name, {value}},
+    PROFILE_EVENTS_LIST(PROFILE_EVENTS_ENUM, PROFILE_EVENTS_DISABLE)
+#undef PROFILE_EVENTS_ENUM
 };
+
+enum profile_event_type {
+#define PROFILE_EVENTS_ENUM(name, value) name,
+  PROFILE_EVENTS_LIST(PROFILE_EVENTS_ENUM, PROFILE_EVENTS_DISABLE)
+#undef PROFILE_EVENTS_ENUM
+};
+
+static const char *profile_event_names[] = {
+#define PROFILE_EVENTS_ENUM(name, value) #name,
+    PROFILE_EVENTS_LIST(PROFILE_EVENTS_ENUM, PROFILE_EVENTS_DISABLE)
+#undef PROFILE_EVENTS_ENUM
+};
+
+static constexpr usize profile_event_count = sizeof(profile_events) / sizeof(profile_events[0]);
 
 static kpep_event *get_event(kpep_db *db, const event_alias *alias) {
   for (usize j = 0; j < EVENT_NAME_MAX; j++) {
@@ -862,13 +823,42 @@ static kpep_event *get_event(kpep_db *db, const event_alias *alias) {
   return NULL;
 }
 
+struct performance_counters {
+  std::valarray<u64> counters;
+  performance_counters(u64 init) : counters(init, profile_event_count) {}
+  performance_counters(const std::valarray<u64> &another)
+      : counters(another) {}
+  performance_counters(std::initializer_list<u64> raw_counters)
+      : counters(raw_counters) {}
+
+  inline performance_counters &operator-=(const performance_counters &other) {
+    counters -= other.counters;
+    return *this;
+  }
+
+  inline performance_counters &operator+=(const performance_counters &other) {
+    counters += other.counters;
+    return *this;
+  }
+
+  inline performance_counters &min(const performance_counters &other) {
+    for (size_t i = 0; i < counters.size(); i++)
+      counters[i] = std::min(counters[i], other.counters[i]);
+    return *this;
+  }
+};
+
+inline performance_counters operator-(const performance_counters &a,
+                                      const performance_counters &b) {
+  return performance_counters(a.counters - b.counters);
+}
+
 struct AppleEvents {
   kpc_config_t regs[KPC_MAX_COUNTERS] = {0};
   usize counter_map[KPC_MAX_COUNTERS] = {0};
   u64 counters_0[KPC_MAX_COUNTERS] = {0};
   u64 counters_1[KPC_MAX_COUNTERS] = {0};
-  static constexpr usize ev_count =
-      sizeof(profile_events) / sizeof(profile_events[0]);
+  static constexpr usize ev_count = profile_event_count;
   bool init = false;
   bool worked = false;
 
@@ -961,7 +951,7 @@ struct AppleEvents {
     }
 
     // set config to kernel
-    if ((ret = kpc_force_all_ctrs_set(1))) {
+    if (force_ctrs == 0 && (ret = kpc_force_all_ctrs_set(1))) {
       printf("Failed force all ctrs: %d.\n", ret);
       return (worked = false);
     }
@@ -991,16 +981,17 @@ struct AppleEvents {
     // get counters before
     if ((ret = kpc_get_thread_counters(0, KPC_MAX_COUNTERS, counters_0))) {
       if (!warned) {
-
         printf("Failed get thread counters before: %d.\n", ret);
         warned = true;
       }
-      return 1;
+      return performance_counters{};
     }
-    return performance_counters{
-        counters_0[counter_map[0]], counters_0[counter_map[2]],
-        counters_0[counter_map[3]], counters_0[counter_map[1]]};
-  }
-};
+    return performance_counters {
+#define PROFILE_EVENTS_ENUM(name, value) counters_0[counter_map[name]],
+        PROFILE_EVENTS_LIST(PROFILE_EVENTS_ENUM, PROFILE_EVENTS_DISABLE)
+#undef PROFILE_EVENTS_ENUM
+      };
+    }
+  };
 
 #endif
