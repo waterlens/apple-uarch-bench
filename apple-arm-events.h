@@ -61,6 +61,7 @@ typedef int32_t i32;
 typedef uint32_t u32;
 typedef int64_t i64;
 typedef uint64_t u64;
+typedef __uint128_t u128;
 typedef size_t usize;
 
 // -----------------------------------------------------------------------------
@@ -784,7 +785,7 @@ typedef struct {
   X(EventTakenBrs, "INST_BRANCH_TAKEN")                                        \
   X(EventBrMisses, "BRANCH_MISPRED_NONSPEC")                                   \
   X(EventCallMisses, "BRANCH_CALL_INDIR_MISPRED_NONSPEC")                      \
-  X(EventRetMisses, "BRANCH_RET_INDIR_MISPRED_NONSPEC")                        \
+  _(EventRetMisses, "BRANCH_RET_INDIR_MISPRED_NONSPEC")                        \
   X(EventCondBrMisses, "BRANCH_COND_MISPRED_NONSPEC")                          \
   X(EventIndirMisses, "BRANCH_INDIR_MISPRED_NONSPEC")
 
