@@ -1,39 +1,5 @@
-// Original design from:
-// =============================================================================
-// XNU kperf/kpc
-// Available for 64-bit Intel/Apple Silicon, macOS/iOS, with root privileges
-//
-// References:
-//
-// XNU source (since xnu 2422.1.72):
-// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/kpc.h
-// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_kpc.c
-//
-// Lightweight PET (Profile Every Thread, since xnu 3789.1.32):
-// https://github.com/apple/darwin-xnu/blob/main/osfmk/kperf/pet.c
-// https://github.com/apple/darwin-xnu/blob/main/osfmk/kperf/kperf_kpc.c
-//
-// System Private frameworks (since macOS 10.11, iOS 8.0):
-// /System/Library/PrivateFrameworks/kperf.framework
-// /System/Library/PrivateFrameworks/kperfdata.framework
-//
-// Xcode framework (since Xcode 7.0):
-// /Applications/Xcode.app/Contents/SharedFrameworks/DVTInstrumentsFoundation.framework
-//
-// CPU database (plist files)
-// macOS (since macOS 10.11):
-//     /usr/share/kpep/<name>.plist
-// iOS (copied from Xcode, since iOS 10.0, Xcode 8.0):
-//     /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform
-//     /DeviceSupport/<version>/DeveloperDiskImage.dmg/usr/share/kpep/<name>.plist
-//
-//
-// Created by YaoYuan <ibireme@gmail.com> on 2021.
-// Released into the public domain (unlicense.org).
-// =============================================================================
-
-#ifndef APPLE_ARM_EVENTS_H
-#define APPLE_ARM_EVENTS_H
+#ifndef APPLE_ARM_COUNTER_H
+#define APPLE_ARM_COUNTER_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,14 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <algorithm>
-#include <dlfcn.h> // for dlopen() and dlsym()
-#include <initializer_list>
+#include <dlfcn.h>          // for dlopen() and dlsym()
 #include <mach/mach_time.h> // for mach_absolute_time()
 #include <sys/kdebug.h>     // for kdebug trace decode
 #include <sys/sysctl.h>     // for sysctl()
 #include <unistd.h>         // for usleep()
-#include <valarray>
 
 typedef float f32;
 typedef double f64;
@@ -60,7 +23,6 @@ typedef int32_t i32;
 typedef uint32_t u32;
 typedef int64_t i64;
 typedef uint64_t u64;
-typedef __uint128_t u128;
 typedef size_t usize;
 
 // -----------------------------------------------------------------------------
@@ -772,8 +734,6 @@ typedef struct {
   const char *names[EVENT_NAME_MAX]; /// name from pmc db
 } event_alias;
 
-/// Event names from /usr/share/kpep/<name>.plist
-
 #define PROFILE_EVENTS_LIST(_, X)                                              \
   _(EventCycles, "FIXED_CYCLES")                                               \
   _(EventInsts, "FIXED_INSTRUCTIONS")                                          \
@@ -808,9 +768,9 @@ static const char *profile_event_names[] = {
 #undef PROFILE_EVENTS_ENUM
 };
 
-static constexpr usize profile_event_count = sizeof(profile_events) / sizeof(profile_events[0]);
+#define profile_event_count (sizeof(profile_events) / sizeof(profile_events[0]))
 
-static kpep_event *get_event(kpep_db *db, const event_alias *alias) {
+static inline kpep_event *get_event(kpep_db *db, const event_alias *alias) {
   for (usize j = 0; j < EVENT_NAME_MAX; j++) {
     const char *name = alias->names[j];
     if (!name)
@@ -823,175 +783,163 @@ static kpep_event *get_event(kpep_db *db, const event_alias *alias) {
   return NULL;
 }
 
-struct performance_counters {
-  std::valarray<u64> counters;
-  performance_counters(u64 init) : counters(init, profile_event_count) {}
-  performance_counters(const std::valarray<u64> &another)
-      : counters(another) {}
-  performance_counters(std::initializer_list<u64> raw_counters)
-      : counters(raw_counters) {}
-
-  inline performance_counters &operator-=(const performance_counters &other) {
-    counters -= other.counters;
-    return *this;
-  }
-
-  inline performance_counters &operator+=(const performance_counters &other) {
-    counters += other.counters;
-    return *this;
-  }
-
-  inline performance_counters &min(const performance_counters &other) {
-    for (size_t i = 0; i < counters.size(); i++)
-      counters[i] = std::min(counters[i], other.counters[i]);
-    return *this;
-  }
+struct perf_counters {
+  kpc_config_t regs[KPC_MAX_COUNTERS];
+  usize reg_count;
+  usize counter_map[KPC_MAX_COUNTERS];
+  u64 counters0[KPC_MAX_COUNTERS];
+  u64 counters1[KPC_MAX_COUNTERS];
+  u32 classes;
 };
 
-inline performance_counters operator-(const performance_counters &a,
-                                      const performance_counters &b) {
-  return performance_counters(a.counters - b.counters);
-}
+static bool init_perf_counters(struct perf_counters *counters) {
+  // check permission
+  int force_ctrs = 0;
+  if (kpc_force_all_ctrs_get(&force_ctrs)) {
+    printf("Permission denied, xnu/kpc requires root privileges.\n");
+    return false;
+  }
+  int ret;
 
-struct AppleEvents {
-  kpc_config_t regs[KPC_MAX_COUNTERS] = {0};
-  usize counter_map[KPC_MAX_COUNTERS] = {0};
-  u64 counters_0[KPC_MAX_COUNTERS] = {0};
-  u64 counters_1[KPC_MAX_COUNTERS] = {0};
-  static constexpr usize ev_count = profile_event_count;
-  bool init = false;
-  bool worked = false;
+  // load pmc db
+  kpep_db *db = NULL;
+  if ((ret = kpep_db_create(NULL, &db))) {
+    printf("Error: cannot load pmc database: %d.\n", ret);
+    return false;
+  }
+  printf("loaded db: %s (%s)\n", db->name, db->marketing_name);
+  printf("number of fixed counters: %zu\n", db->fixed_counter_count);
+  printf("number of configurable counters: %zu\n", db->config_counter_count);
 
-  inline bool setup_performance_counters() {
-    if (init) {
-      return worked;
-    }
-    init = true;
-
-    // load dylib
-    if (!lib_init()) {
-      printf("Error: %s\n", lib_err_msg);
-      return (worked = false);
-    }
-
-    // check permission
-    int force_ctrs = 0;
-    if (kpc_force_all_ctrs_get(&force_ctrs)) {
-      printf("Permission denied, xnu/kpc requires root privileges.\n");
-      return (worked = false);
-    }
-    int ret;
-    // load pmc db
-    kpep_db *db = NULL;
-    if ((ret = kpep_db_create(NULL, &db))) {
-      printf("Error: cannot load pmc database: %d.\n", ret);
-      return (worked = false);
-    }
-    printf("loaded db: %s (%s)\n", db->name, db->marketing_name);
-    // printf("number of fixed counters: %zu\n", db->fixed_counter_count);
-    // printf("number of configurable counters: %zu\n",
-    // db->config_counter_count);
-
-    // create a config
-    kpep_config *cfg = NULL;
-    if ((ret = kpep_config_create(db, &cfg))) {
-      printf("Failed to create kpep config: %d (%s).\n", ret,
-             kpep_config_error_desc(ret));
-      return (worked = false);
-    }
-    if ((ret = kpep_config_force_counters(cfg))) {
-      printf("Failed to force counters: %d (%s).\n", ret,
-             kpep_config_error_desc(ret));
-      return (worked = false);
-    }
-
-    // get events
-    kpep_event *ev_arr[ev_count] = {0};
-    for (usize i = 0; i < ev_count; i++) {
-      const event_alias *alias = profile_events + i;
-      ev_arr[i] = get_event(db, alias);
-      if (!ev_arr[i]) {
-        printf("Cannot find event: %s.\n", alias->alias);
-        return (worked = false);
-      }
-    }
-
-    // add event to config
-    for (usize i = 0; i < ev_count; i++) {
-      kpep_event *ev = ev_arr[i];
-      if ((ret = kpep_config_add_event(cfg, &ev, 0, NULL))) {
-        printf("Failed to add event: %d (%s).\n", ret,
-               kpep_config_error_desc(ret));
-        return (worked = false);
-      }
-    }
-
-    // prepare buffer and config
-    u32 classes = 0;
-    usize reg_count = 0;
-    if ((ret = kpep_config_kpc_classes(cfg, &classes))) {
-      printf("Failed get kpc classes: %d (%s).\n", ret,
-             kpep_config_error_desc(ret));
-      return (worked = false);
-    }
-    if ((ret = kpep_config_kpc_count(cfg, &reg_count))) {
-      printf("Failed get kpc count: %d (%s).\n", ret,
-             kpep_config_error_desc(ret));
-      return (worked = false);
-    }
-    if ((ret = kpep_config_kpc_map(cfg, counter_map, sizeof(counter_map)))) {
-      printf("Failed get kpc map: %d (%s).\n", ret,
-             kpep_config_error_desc(ret));
-      return (worked = false);
-    }
-    if ((ret = kpep_config_kpc(cfg, regs, sizeof(regs)))) {
-      printf("Failed get kpc registers: %d (%s).\n", ret,
-             kpep_config_error_desc(ret));
-      return (worked = false);
-    }
-
-    // set config to kernel
-    if (force_ctrs == 0 && (ret = kpc_force_all_ctrs_set(1))) {
-      printf("Failed force all ctrs: %d.\n", ret);
-      return (worked = false);
-    }
-    if ((classes & KPC_CLASS_CONFIGURABLE_MASK) && reg_count) {
-      if ((ret = kpc_set_config(classes, regs))) {
-        printf("Failed set kpc config: %d.\n", ret);
-        return (worked = false);
-      }
-    }
-
-    // start counting
-    if ((ret = kpc_set_counting(classes))) {
-      printf("Failed set counting: %d.\n", ret);
-      return (worked = false);
-    }
-    if ((ret = kpc_set_thread_counting(classes))) {
-      printf("Failed set thread counting: %d.\n", ret);
-      return (worked = false);
-    }
-
-    return (worked = true);
+  // create a config
+  kpep_config *cfg = NULL;
+  if ((ret = kpep_config_create(db, &cfg))) {
+    printf("Failed to create kpep config: %d (%s).\n", ret,
+           kpep_config_error_desc(ret));
+    return false;
+  }
+  if ((ret = kpep_config_force_counters(cfg))) {
+    printf("Failed to force counters: %d (%s).\n", ret,
+           kpep_config_error_desc(ret));
+    return false;
   }
 
-  inline performance_counters get_counters() {
-    static bool warned = false;
-    int ret;
-    // get counters before
-    if ((ret = kpc_get_thread_counters(0, KPC_MAX_COUNTERS, counters_0))) {
-      if (!warned) {
-        printf("Failed get thread counters before: %d.\n", ret);
-        warned = true;
-      }
-      return performance_counters{};
+  // get events
+  kpep_event *ev_arr[profile_event_count] = {0};
+  for (usize i = 0; i < profile_event_count; i++) {
+    const event_alias *alias = profile_events + i;
+    ev_arr[i] = get_event(db, alias);
+    if (!ev_arr[i]) {
+      printf("Cannot find event: %s.\n", alias->alias);
+      return false;
     }
-    return performance_counters {
-#define PROFILE_EVENTS_ENUM(name, value) counters_0[counter_map[name]],
-        PROFILE_EVENTS_LIST(PROFILE_EVENTS_ENUM, PROFILE_EVENTS_DISABLE)
-#undef PROFILE_EVENTS_ENUM
-      };
-    }
-  };
+  }
 
+  // add event to config
+  for (usize i = 0; i < profile_event_count; i++) {
+    kpep_event *ev = ev_arr[i];
+    if ((ret = kpep_config_add_event(cfg, &ev, 0, NULL))) {
+      printf("Failed to add event: %d (%s).\n", ret,
+             kpep_config_error_desc(ret));
+      return false;
+    }
+  }
+
+  // prepare buffer and config
+  if ((ret = kpep_config_kpc_classes(cfg, &counters->classes))) {
+    printf("Failed get kpc classes: %d (%s).\n", ret,
+           kpep_config_error_desc(ret));
+    return false;
+  }
+  if ((ret = kpep_config_kpc_count(cfg, &counters->reg_count))) {
+    printf("Failed get kpc count: %d (%s).\n", ret,
+           kpep_config_error_desc(ret));
+    return false;
+  }
+  u32 classes = counters->classes;
+  usize reg_count = counters->reg_count;
+  if ((ret = kpep_config_kpc_map(cfg, counters->counter_map,
+                                 sizeof(counters->counter_map)))) {
+    printf("Failed get kpc map: %d (%s).\n", ret, kpep_config_error_desc(ret));
+    return false;
+  }
+  if ((ret = kpep_config_kpc(cfg, counters->regs, sizeof(counters->regs)))) {
+    printf("Failed get kpc registers: %d (%s).\n", ret,
+           kpep_config_error_desc(ret));
+    return false;
+  }
+
+  // set config to kernel
+  if (force_ctrs == 0 && (ret = kpc_force_all_ctrs_set(1))) {
+    printf("Failed force all ctrs: %d.\n", ret);
+    return false;
+  }
+  if ((classes & KPC_CLASS_CONFIGURABLE_MASK) && reg_count) {
+    if ((ret = kpc_set_config(classes, counters->regs))) {
+      printf("Failed set kpc config: %d.\n", ret);
+      return false;
+    }
+  }
+
+  // start counting
+  if ((ret = kpc_set_counting(classes))) {
+    printf("Failed set counting: %d.\n", ret);
+    return false;
+  }
+  if ((ret = kpc_set_thread_counting(classes))) {
+    printf("Failed set thread counting: %d.\n", ret);
+    return false;
+  }
+
+  return true;
+}
+
+static bool config_perf_counters(struct perf_counters *counters) {
+  int ret;
+
+  int force_ctrs = 0;
+  if (kpc_force_all_ctrs_get(&force_ctrs)) {
+    return false;
+  }
+
+  // set config to kernel
+  if (force_ctrs == 0 && (ret = kpc_force_all_ctrs_set(1))) {
+    printf("Failed force all ctrs: %d.\n", ret);
+    return false;
+  }
+  if ((counters->classes & KPC_CLASS_CONFIGURABLE_MASK) && counters->reg_count) {
+    if ((ret = kpc_set_config(counters->classes, counters->regs))) {
+      printf("Failed set kpc config: %d.\n", ret);
+      return false;
+    }
+  }
+
+  // start counting
+  if ((ret = kpc_set_counting(counters->classes))) {
+    printf("Failed set counting: %d.\n", ret);
+    return false;
+  }
+  if ((ret = kpc_set_thread_counting(counters->classes))) {
+    printf("Failed set thread counting: %d.\n", ret);
+    return false;
+  }
+
+  return true;
+}
+
+static inline u64 read_perf_counters_before(struct perf_counters *counters) {
+  int ret;
+  if ((ret = kpc_get_thread_counters(0, KPC_MAX_COUNTERS, counters->counters0))) {
+    printf("Failed get thread counters before: %d.\n", ret);
+    return -1;
+  }
+  return counters->counters0[counters->counter_map[EventCycles]];
+}
+
+static inline u64 read_perf_counters_after(struct perf_counters *counters) {
+  int ret;
+  if ((ret = kpc_get_thread_counters(0, KPC_MAX_COUNTERS, counters->counters1)))
+    return -1;
+  return counters->counters1[counters->counter_map[EventCycles]];
+}
 #endif
